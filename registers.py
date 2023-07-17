@@ -8,7 +8,9 @@ from sympy.functions.elementary.miscellaneous import Max
 import math
 import re
 import collections
+import operator
 from functools import cmp_to_key
+from functools import reduce
 
 class Registers( object ):
     def __init__( self, name, label, prefix, description, skip_index,
@@ -25,6 +27,7 @@ class Registers( object ):
 
     def add_register( self, register ):
         self.registers.append( register )
+        register.registers = self
 
 def sympy_compare_lowBit( a, b ):
     if sympy.simplify("(%s) > (%s)" % ( a.lowBit, b.lowBit )) == True:
@@ -48,6 +51,7 @@ class Register( object ):
     def add_field( self, field ):
         self.fields.append( field )
         self.fields.sort( key=cmp_to_key(sympy_compare_lowBit), reverse=True )
+        field.register = self
 
     def check( self ):
         previous = None
@@ -72,12 +76,21 @@ class Register( object ):
 
     def width( self ):
         if self.fields:
-            return Max(*(f.highBit for f in self.fields))
+            return Max(*(f.highBit for f in self.fields)) + 1
         else:
             return 0
 
     def __str__( self ):
         return self.name
+
+    def to_c_filter(self):
+        return self.define and not self.address is None
+
+    def address_define_name(self):
+        return self.registers.prefix + toCIdentifier( self.short or self.label ).upper()
+
+    def ordinal_name(self):
+        return self.address_define_name() + "_ORDINAL"
 
 class Value( object ):
     def __init__( self, element ):
@@ -138,6 +151,9 @@ class Field( object ):
     def length( self ):
         return sympy.simplify( "1 + (%s) - (%s)" % ( self.highBit, self.lowBit ) )
 
+    def symbols( self ):
+        return sympy.simplify(self.lowBit).atoms(sympy.Symbol) | sympy.simplify(self.highBit).atoms(sympy.Symbol)
+
     def columnWidth( self ):
         text = str( self.length() )
         if text.isdigit():
@@ -157,6 +173,18 @@ class Field( object ):
 
     def __str__( self ):
         return self.name
+
+    def mask(self):
+        return ((2 ** sympy.simplify(self.length())) - 1) * (2 ** sympy.simplify(self.lowBit))
+
+    def to_c_filter(self):
+        return self.define
+
+    def mask_define_name(self):
+        return f"{self.register.address_define_name()}_{toCIdentifier( self.name ).upper()}"
+
+    def offset_define_name(self):
+        return self.mask_define_name() + "_OFFSET"
 
 def parse_bits( field ):
     """Return high, low (inclusive)."""
@@ -281,8 +309,11 @@ class Macro:
     def body(self):
         return self.expression
 
-def sympy_to_c(expression):
+def sympy_to_c(expression, sym_to_c = lambda s: "(" + str(s) + ")"):
+    stc = lambda x : sympy_to_c(x, sym_to_c)
     """Implement our own string function, so we can replace 2** with 1<<."""
+    if isinstance(expression, str):
+        return expression
     if isinstance(expression, sympy.Number):
         if (expression >= 2**32):
             return "0x%xULL" % expression
@@ -299,56 +330,67 @@ def sympy_to_c(expression):
         else:
             return "-0x%xULL" % -expression
     elif isinstance(expression, sympy.Symbol):
-        return str(expression)
+        return sym_to_c(expression)
     elif isinstance(expression, sympy.Add):
-        return "(" + " + ".join(sympy_to_c(t) for t in reversed(expression.args)) + ")"
+        return "(" + " + ".join(stc(t) for t in reversed(expression.args)) + ")"
     elif isinstance(expression, sympy.Mul):
-        return "(" + " * ".join(sympy_to_c(t) for t in expression.args) + ")"
+        return "(" + " * ".join(stc(t) for t in expression.args) + ")"
     elif isinstance(expression, sympy.Pow):
         base, exponent = expression.as_base_exp()
         assert base == 2, "Power must have base of two, not %r" % base
-        return "(1ULL<<%s)" % sympy_to_c(exponent)
+        return "(1ULL << %s)" % stc(exponent)
+    elif isinstance(expression, Max):
+        args = list(map(stc, expression.args))
+        def c_max(args):
+            if len(args) == 1:
+                return args[0]
+            if len(args) == 2:
+                return f"{args[0]} > {args[1]} ? {args[0]} : {args[1]}"
+            return f"{args[0]} > {args[1]} ? {[args[0]] + [args[2:]]} : {args[1:]}"
+        return c_max(args)
     raise Exception("Unsupported sympy object %r of type %r" % (expression, type(expression)))
 
 def write_cheader( fd, registers ):
     definitions = []
     for r in registers.registers:
-        name = toCIdentifier( r.short or r.label ).upper()
-        prefname = registers.prefix + name
-        if r.define and not r.address is None:
-            definitions.append((prefname, r.address))
+        if r.to_c_filter():
+            definitions.append((r.address_define_name(), r.address))
         try:
             if r.width() <= 32:
                 suffix = "U"
+                format_specifyer = "PRIx32"
             else:
                 suffix = "ULL"
+                format_specifyer = "PRIx64"
         except TypeError:
             suffix = "ULL"
+            format_specifyer = "PRIx64"
+        format_string = []
+        format_args = []
         for f in r.fields:
-            if f.define:
+            if f.to_c_filter():
                 if f.description:
                     definitions.append(( "comment", f.description ))
-                prefix = "%s_%s" % ( prefname, toCIdentifier( f.name ).upper() )
                 offset = Macro(
-                    "%s_OFFSET" % prefix,
+                    f.offset_define_name(),
                     f.lowBit
                 )
                 definitions.append(( offset.prototype(), offset.body() ))
                 length = Macro(
-                    "%s_LENGTH" % prefix,
+                    "%s_LENGTH" % f.mask_define_name(),
                     f.length()
                 )
                 definitions.append(( length.prototype(), length.body() ))
                 # sympy doesn't support a bit shift (<<) operator, so here we
                 # use power (**) instead.
                 mask = Macro(
-                    prefix,
-                    ((2 ** sympy.simplify(f.length())) - 1) * (2 ** sympy.simplify(f.lowBit))
+                    f.mask_define_name(),
+                    f.mask()
                 )
                 definitions.append(( mask.prototype(), mask.body() ))
 
                 for v in f.values:
-                    definitions += v.to_c_definitions(prefix)
+                    definitions += v.to_c_definitions(f.mask_define_name())
 
     counted = collections.Counter(name for name, value in definitions)
     for name, value in definitions:
@@ -359,9 +401,225 @@ def write_cheader( fd, registers ):
             fd.write( " */\n" )
             continue
         if counted[name] == 1:
-            if not isinstance(value, str):
-                value = sympy_to_c(value)
+            value = sympy_to_c(value)
             fd.write( "#define %-35s %s\n" % ( name, value ) )
+
+def c_function_definition( return_type, name, args, body, fd=None):
+    if (return_type[-1] != "*"):
+        return_type += " "
+    decl = f"{return_type}{name}"
+    "({args})\n"
+    def add_arg(decl, arg, fs = ", "):
+        next_decl = decl + fs + arg
+        if len(next_decl) - decl.find("\n") < 80:
+            return next_decl
+        return decl + fs.strip() + "\n\t\t" + arg
+
+    decl = add_arg(decl, args[0], "(")
+    for arg in args[1:]:
+        decl = add_arg(decl, arg)
+    decl += ")"
+
+    if fd:
+        fd.write(decl + ";\n")
+
+    args = ", ".join(args)
+    body = body.replace("\n", "\n\t")
+    return decl + "\n{\n\t"f"{body}""\n}\n"
+
+def c_switch_stmnt( expr, case_blocks, default=None ):
+    body = collections.defaultdict(list)
+    for value, result in case_blocks:
+        body[result].append(value)
+
+    body_string = ""
+    for case_result in body.keys():
+        if case_result == default:
+            continue
+        for c in body[case_result]:
+            body_string += f"case {c}:\n"
+        body_string += "\t"
+        body_string += case_result.replace("\n", "\n\t") + "\n"
+
+    if (default is not None):
+        if body_string == "":
+            return default
+        body_string += "default:\n\t"
+        body_string += default.replace("\n", "\n\t")
+    return f"switch ({expr}) ""{"f"\n{body_string}\n""}"
+
+def c_if_stmnt( expr, then_block):
+    return f"if (" + expr  + ")\n\t" + then_block.replace("\n", "\n\t")
+
+def get_symbols( expr ):
+    return sympy.simplify(expr).atoms(sympy.Symbol)
+
+def sym_is_set( symbol ):
+    return f"context.{symbol}.is_set"
+
+def c_all_are_set( symbols ):
+    return ' && '.join(map(sym_is_set, symbols))
+
+def sym_value( symbol ):
+    return f"context.{symbol}.value"
+
+def to_c_ctx( s ):
+    return sympy_to_c(s, lambda s: sym_value(s))
+
+def to_c_ctx_if_set( expr, default ):
+    body = f"return {to_c_ctx(expr)};"
+    symbols = get_symbols(expr)
+    if symbols:
+        body = c_if_stmnt(f"!({c_all_are_set(get_symbols(expr))})", default) + "\n" + body
+    return body
+
+def switch_offset(r, gen_body_for_field, default):
+    symbols = reduce(operator.or_, (f.symbols() for f in r.fields if f.to_c_filter()), get_symbols(r.width()))
+    if symbols:
+        default = "\n".join(
+                [c_if_stmnt(f"!({c_all_are_set(symbols)})", default)] +
+                [c_if_stmnt(
+                    f"offset == {to_c_ctx(sympy.simplify(f.lowBit))}",
+                    gen_body_for_field(f, default)
+                    )
+                 for f in r.fields if f.to_c_filter() and f.symbols()] +
+                [default]
+                )
+    return c_switch_stmnt(
+            "offset",
+            ((f.offset_define_name(), gen_body_for_field(f, default))
+             for f in r.fields if f.to_c_filter() and not f.symbols()),
+            default
+            )
+
+def print_cgetters_for_reg(r, all_symbols, fd):
+    prefix = r.address_define_name()
+    context_type = "void"
+    args = [f"struct riscv_debug_reg_ctx context"]
+
+    fd.write(c_function_definition(
+        "unsigned int",
+        f"{prefix}_width",
+        args,
+        to_c_ctx_if_set(r.width(), "return 0;")
+        ))
+
+    fd.write(c_function_definition(
+        "unsigned int",
+        f"{prefix}_field_is_present",
+        args + ["unsigned int offset"],
+        switch_offset(
+            r,
+            lambda f, default: "return 1;",
+            default="return 0;"
+            )
+        ))
+
+    fd.write(c_function_definition(
+        "const char *",
+        f"{prefix}_field_name",
+        args + ["unsigned int offset"],
+        switch_offset(
+            r,
+            lambda f, default: f'return "{f.name}";',
+            default="return NULL;"
+            )
+        ))
+
+    fd.write(c_function_definition(
+        "unsigned long long",
+        f"{prefix}_field_value",
+        args + ["unsigned int offset", "unsigned long long value"],
+        switch_offset(
+            r,
+            lambda f, default: f"return value & {to_c_ctx(f.mask())} >> {to_c_ctx(sympy.simplify(f.lowBit))};",
+            default="return 0;"
+            )
+        ))
+
+    fd.write(c_function_definition(
+        "const char *",
+        f"{prefix}_field_value_name",
+        args + ["unsigned int offset", "unsigned int field_value"],
+        switch_offset(r, lambda f, default: c_switch_stmnt(
+            "field_value",
+            ((v.value, f'return "{v.name}";')
+             for v in f.values if v.name and v.value and not (r.address == "0x11" and f.lowBit == "0")), #WA for DTM_DMI_OP
+            default), default="return NULL;"
+                      )
+        ))
+
+def print_cgetters( registers_list, file_name ):
+    fd_h = open( file_name + ".h", "a" )
+    fd_c = open( file_name + ".c", "w" )
+
+    fd_c.write(f'#include "{file_name}.h"\n#include <stddef.h>\n')
+    all_regs = [r for registers in registers_list for r in registers.registers if r.fields and r.to_c_filter()]
+    fd_h.write("enum riscv_debug_reg_ordinal {\n\t"
+          + ",\n\t".join(
+              r.ordinal_name()
+              for r in all_regs
+              )
+          + "\n};\n")
+    join_sets = lambda a, b: a | b
+    all_symbols = reduce(
+            operator.or_,
+            (f.symbols()
+             for r in all_regs for f in r.fields if f.to_c_filter()))
+    fd_h.write(f"struct riscv_debug_reg_ctx " + "{\n\t"
+          + ";\n\t".join("struct {\n\t\tunsigned int value; int is_set;\n\t} " + str(s) for s in all_symbols)
+          + ";\n};\n")
+
+    for registers in registers_list:
+        for r in registers.registers:
+            if r.fields and r.to_c_filter():
+                print_cgetters_for_reg(r, all_regs, fd_c)
+
+    def switch_reg_ordinal_func(return_type, func_name, extra_args, default):
+        args = ["enum riscv_debug_reg_ordinal reg_ordinal",
+                "struct riscv_debug_reg_ctx context"] + extra_args
+        call_args = ', '.join(arg.split()[-1] for arg in args[1:])
+        return c_function_definition(
+                return_type,
+                f"riscv_debug_reg_{func_name}",
+                args,
+                c_switch_stmnt(
+                    "reg_ordinal",
+                    ((r.ordinal_name(),
+                      f"return {r.address_define_name()}_{func_name}({call_args});")
+                     for r in all_regs),
+                    default),
+                fd_h)
+
+    fd_c.write(switch_reg_ordinal_func(
+        "unsigned int",
+        "width",
+        [],
+        default="return 0;"))
+
+    fd_c.write(switch_reg_ordinal_func(
+        "unsigned int",
+        "field_is_present",
+        ["unsigned int offset"],
+        default="return 0;"))
+
+    fd_c.write(switch_reg_ordinal_func(
+        "const char *",
+        "field_name",
+        ["unsigned int offset"],
+        default="return NULL;"))
+
+    fd_c.write(switch_reg_ordinal_func(
+        "unsigned long long",
+        "field_value",
+        ["unsigned int offset", "unsigned long long value"],
+        default="return 0;"))
+
+    fd_c.write(switch_reg_ordinal_func(
+        "const char *",
+        "field_value_name",
+        ["unsigned int offset", "unsigned int field_value"],
+        default="return NULL;"))
 
 def write_chisel( fd, registers ):
     fd.write("package freechips.rocketchip.devices.debug\n\n")
@@ -655,7 +913,13 @@ def main():
             help='Write C #defines to the named file.' )
     parser.add_argument( '--chisel',
             help='Write Scala Classes to the named file.' )
+    parser.add_argument( '--cgetters', dest='xml_paths', nargs='+')
     parsed = parser.parse_args()
+
+    if (parsed.xml_paths):
+        registers_list = [parse_xml( xml_path ) for xml_path in parsed.xml_paths]
+        print_cgetters(registers_list, parsed.path)
+        return
 
     registers = parse_xml( parsed.path )
     if parsed.definitions:
